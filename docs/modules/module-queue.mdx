@@ -19,8 +19,8 @@ iii-queue
 
 Register consumers for a topic and emit events to it. Messages are delivered using **fan-out per function**: every distinct function subscribed to a topic receives a copy of each message. When multiple replicas of the same function are running, they compete on a shared per-function queue — only one replica processes each message.
 
-1. **Register a consumer** with `registerTrigger({ type: 'queue', function_id: 'my::handler', config: { topic: 'order.created' } })`. This subscribes the handler to that topic.
-2. **Emit events** by calling `trigger({ function_id: 'enqueue', payload: { topic: 'order.created', data: payload } })` or `trigger({ function_id: 'enqueue', payload: { topic, data }, action: TriggerAction.Void() })` for fire-and-forget. The `enqueue` function fans out the payload to every subscribed function.
+1. **Register a consumer** with `registerTrigger({ type: 'durable:subscriber', function_id: 'my::handler', config: { topic: 'order.created' } })`. This subscribes the handler to that topic.
+2. **Emit events** by calling `trigger({ function_id: 'iii::durable::publish', payload: { topic: 'order.created', data: payload } })` or `trigger({ function_id: 'iii::durable::publish', payload: { topic, data }, action: TriggerAction.Void() })` for fire-and-forget. The `iii::durable::publish` function fans out the payload to every subscribed function.
 3. **Action on the trigger**: the handler receives the `data` as its input. Optional `queue_config` on the trigger controls per-subscriber retries and concurrency.
 
 The producer knows the topic name; consumers register to receive it. Queue settings can live at the trigger registration site.
@@ -43,8 +43,8 @@ The producer targets the function and queue explicitly. Queue configuration is c
 
 | | Topic-based | Named queues |
 |---|---|---|
-| **Producer** | Calls `trigger({ function_id: 'enqueue', payload: { topic, data } })` | Calls `trigger({ function_id, payload, action: TriggerAction.Enqueue({ queue }) })` |
-| **Consumer** | Registers `registerTrigger({ type: 'queue', config: { topic } })` | No registration — function is the target |
+| **Producer** | Calls `trigger({ function_id: 'iii::durable::publish', payload: { topic, data } })` | Calls `trigger({ function_id, payload, action: TriggerAction.Enqueue({ queue }) })` |
+| **Consumer** | Registers `registerTrigger({ type: 'durable:subscriber', config: { topic } })` | No registration — function is the target |
 | **Delivery** | Fan-out: each subscribed function gets every message; replicas compete | Single target function per enqueue call |
 | **Config** | Optional `queue_config` on trigger | `queue_configs` in `iii-config.yaml` |
 | **Use case** | Durable pub/sub with retries and fan-out | Direct function invocation with retries, FIFO, DLQ |
@@ -300,7 +300,7 @@ Regardless of which adapter you choose, retry semantics, concurrency enforcement
 
 The queue module registers the following functions automatically when it initializes. These are callable via `trigger()` from any SDK or via the `iii trigger` CLI command.
 
-### enqueue
+### iii::durable::publish
 
 Publishes a message to a topic-based queue. The message is fanned out to every distinct function subscribed to that topic. Replicas of the same function compete on a shared per-function queue.
 
@@ -389,7 +389,7 @@ sequenceDiagram
 
     Note over Q1,Q2: Both functions subscribed to topic "order.created"
 
-    P->>E: enqueue({ topic: "order.created", data })
+    P->>E: iii::durable::publish({ topic: "order.created", data })
 
     par Engine copies message to each function's queue
         E->>Q1: push(data)
@@ -403,7 +403,7 @@ sequenceDiagram
     Q2->>A1: deliver
     A1-->>Q2: Ack
 
-    P->>E: enqueue({ topic: "order.created", data })
+    P->>E: iii::durable::publish({ topic: "order.created", data })
 
     par
         E->>Q1: push(data)
