@@ -314,15 +314,54 @@ fn all_builtins_produce_valid_config_entries() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// handle_managed_add_many flow tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn add_many_builtin_workers() {
+    in_temp_dir_async(|| async {
+        let names = vec!["iii-http".to_string(), "iii-state".to_string()];
+        let exit_code = iii_worker::cli::managed::handle_managed_add_many(&names).await;
+        assert_eq!(exit_code, 0, "all builtin workers should succeed");
+
+        assert!(
+            iii_worker::cli::config_file::worker_exists("iii-http"),
+            "iii-http should be in config.yaml"
+        );
+        assert!(
+            iii_worker::cli::config_file::worker_exists("iii-state"),
+            "iii-state should be in config.yaml"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn add_many_with_invalid_worker_returns_nonzero() {
+    in_temp_dir_async(|| async {
+        let names = vec![
+            "iii-http".to_string(),
+            "definitely-not-a-real-worker-xyz".to_string(),
+        ];
+        let exit_code = iii_worker::cli::managed::handle_managed_add_many(&names).await;
+        assert_ne!(exit_code, 0, "should fail when any worker fails");
+
+        assert!(
+            iii_worker::cli::config_file::worker_exists("iii-http"),
+            "iii-http should still be in config.yaml despite other failure"
+        );
+    })
+    .await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // handle_managed_add flow tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn handle_managed_add_builtin_creates_config() {
     in_temp_dir_async(|| async {
-        let exit_code =
-            iii_worker::cli::managed::handle_managed_add("iii-http", "libkrun", "localhost", 49134)
-                .await;
+        let exit_code = iii_worker::cli::managed::handle_managed_add("iii-http", false, None).await;
         assert_eq!(
             exit_code, 0,
             "expected success exit code for builtin worker"
@@ -351,7 +390,7 @@ async fn handle_managed_add_builtin_merges_existing() {
         .unwrap();
 
         let exit_code =
-            iii_worker::cli::managed::handle_managed_add("iii-http", "libkrun", "localhost", 49134)
+            iii_worker::cli::managed::handle_managed_add("iii-http", false, None)
                 .await;
         assert_eq!(exit_code, 0, "expected success exit code for merge");
 
@@ -372,9 +411,7 @@ async fn handle_managed_add_all_builtins_succeed() {
         for name in iii_worker::cli::builtin_defaults::BUILTIN_NAMES {
             let _ = std::fs::remove_file("config.yaml");
 
-            let exit_code =
-                iii_worker::cli::managed::handle_managed_add(name, "libkrun", "localhost", 49134)
-                    .await;
+            let exit_code = iii_worker::cli::managed::handle_managed_add(name, false, None).await;
             assert_eq!(exit_code, 0, "expected success for builtin '{}'", name);
 
             let content = std::fs::read_to_string("config.yaml").unwrap();
@@ -384,6 +421,56 @@ async fn handle_managed_add_all_builtins_succeed() {
                 name
             );
         }
+    })
+    .await;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// handle_managed_remove_many flow tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn remove_many_workers() {
+    in_temp_dir_async(|| async {
+        // Add two builtins first.
+        let names = vec!["iii-http".to_string(), "iii-state".to_string()];
+        let exit_code = iii_worker::cli::managed::handle_managed_add_many(&names).await;
+        assert_eq!(exit_code, 0);
+
+        // Remove both at once.
+        let exit_code = iii_worker::cli::managed::handle_managed_remove_many(&names).await;
+        assert_eq!(exit_code, 0, "all removals should succeed");
+
+        assert!(
+            !iii_worker::cli::config_file::worker_exists("iii-http"),
+            "iii-http should be removed"
+        );
+        assert!(
+            !iii_worker::cli::config_file::worker_exists("iii-state"),
+            "iii-state should be removed"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn remove_many_with_missing_worker_returns_nonzero() {
+    in_temp_dir_async(|| async {
+        // Add one builtin.
+        let add_names = vec!["iii-http".to_string()];
+        let exit_code = iii_worker::cli::managed::handle_managed_add_many(&add_names).await;
+        assert_eq!(exit_code, 0);
+
+        // Remove existing + nonexistent.
+        let remove_names = vec!["iii-http".to_string(), "not-a-real-worker".to_string()];
+        let exit_code = iii_worker::cli::managed::handle_managed_remove_many(&remove_names).await;
+        assert_ne!(exit_code, 0, "should fail when any removal fails");
+
+        // The valid one should still have been removed.
+        assert!(
+            !iii_worker::cli::config_file::worker_exists("iii-http"),
+            "iii-http should be removed despite other failure"
+        );
     })
     .await;
 }
