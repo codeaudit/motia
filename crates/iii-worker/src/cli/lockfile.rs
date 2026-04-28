@@ -13,9 +13,30 @@ use std::path::Path;
 const LOCKFILE_VERSION: u8 = 1;
 const LOCKFILE_NAME: &str = "iii.lock";
 
+/// Prefix for the manifest_hash header value: "sha256:v1:<64-hex>".
+/// The "v1" segment is the hash ALGORITHM version, independent of the
+/// lockfile FORMAT version. Changing the hash scheme in the future bumps
+/// this to "v2", and readers detect and recompute rather than silently
+/// accept a mismatched hash. Keeping it adjacent to the hex makes the
+/// shape greppable and the intent obvious in diffs.
+pub const MANIFEST_HASH_PREFIX: &str = "sha256:v1:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLockfile {
     pub version: u8,
+    /// SHA-256 of the canonical manifest_dependencies serialization, prefixed
+    /// with [`MANIFEST_HASH_PREFIX`]. Optional for backward compat with locks
+    /// written before Lane A; absence means "drift detection unavailable for
+    /// this lock, treat all syncs as potentially drifted and re-resolve."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
+    /// The project's declared `iii.worker.yaml` dependencies at lock-write
+    /// time. `Some(map)` (even empty) means the lock was written by Lane A or
+    /// later and drift reports can name the exact added/removed/changed deps.
+    /// `None` means legacy lock — drift detection falls back to hash-only
+    /// compare without structured attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_dependencies: Option<BTreeMap<String, String>>,
     pub workers: BTreeMap<String, LockedWorker>,
 }
 
@@ -109,9 +130,29 @@ impl Default for WorkerLockfile {
     fn default() -> Self {
         Self {
             version: LOCKFILE_VERSION,
+            manifest_hash: None,
+            declared_dependencies: None,
             workers: BTreeMap::new(),
         }
     }
+}
+
+/// Returns `true` if `s` matches the `"sha256:v1:<64-lowercase-hex>"`
+/// manifest-hash shape. Used by lockfile validation and drift detection.
+///
+/// Comparison against `compute_manifest_hash` output is byte-exact, and
+/// `hex::encode` always emits lowercase — so an uppercase-hex hash
+/// would silently never match and trigger false-positive drift on every
+/// sync. We reject uppercase here so the validator catches that
+/// hand-edit immediately.
+pub fn is_valid_manifest_hash(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix(MANIFEST_HASH_PREFIX) else {
+        return false;
+    };
+    rest.len() == 64
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 impl WorkerLockfile {
@@ -135,9 +176,59 @@ impl WorkerLockfile {
         Self::from_yaml(&content)
     }
 
+    /// Write the lockfile atomically: serialize, write to an adjacent temp
+    /// file in the same directory, fsync, then `rename(2)` over the dest.
+    /// On POSIX rename is atomic on the same filesystem, so a concurrent
+    /// reader sees either the previous content or the new content, never
+    /// a partial mixture. On rename failure the temp file is cleaned up;
+    /// the destination is untouched.
     pub fn write_to(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+
         let yaml = self.to_yaml()?;
-        std::fs::write(path, yaml).map_err(|e| format!("failed to write {}: {e}", path.display()))
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let dir = parent.unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("invalid lockfile path: {}", path.display()))?
+            .to_string_lossy();
+
+        // PID + nanosecond timestamp + counter keeps the temp name unique
+        // across concurrent writers within this process and across forks.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(".{file_name}.tmp.{}.{nanos}.{nonce}", std::process::id());
+        let tmp_path = dir.join(&tmp_name);
+
+        let cleanup = |tmp: &Path| {
+            let _ = std::fs::remove_file(tmp);
+        };
+
+        let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+            format!(
+                "failed to create temp lockfile adjacent to {}: {e}",
+                path.display()
+            )
+        })?;
+        if let Err(e) = file.write_all(yaml.as_bytes()) {
+            cleanup(&tmp_path);
+            return Err(format!("failed to write {}: {e}", path.display()));
+        }
+        if let Err(e) = file.sync_all() {
+            cleanup(&tmp_path);
+            return Err(format!("failed to fsync {}: {e}", path.display()));
+        }
+        drop(file);
+
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            cleanup(&tmp_path);
+            return Err(format!("failed to write {}: {e}", path.display()));
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -146,6 +237,65 @@ impl WorkerLockfile {
                 "unsupported {LOCKFILE_NAME} version {} (expected {})",
                 self.version, LOCKFILE_VERSION
             ));
+        }
+
+        if let Some(hash) = &self.manifest_hash
+            && !is_valid_manifest_hash(hash)
+        {
+            return Err(format!(
+                "{LOCKFILE_NAME} manifest_hash must match \
+                 `{MANIFEST_HASH_PREFIX}<64-lowercase-hex>`; got `{hash}`"
+            ));
+        }
+
+        // `manifest_hash` and `declared_dependencies` must be paired:
+        // `(None, None)` is a legacy lock (drift detection skipped),
+        // `(Some, None)` is hash-only attribution, and `(Some, Some)` is
+        // the full Lane-A shape. `(None, Some)` is the dangerous combo
+        // — it means the deps are recorded but drift detection is
+        // disabled, so stripping the hash from a Lane-A lock would
+        // silently bypass `--frozen`.
+        if self.declared_dependencies.is_some() && self.manifest_hash.is_none() {
+            return Err(format!(
+                "{LOCKFILE_NAME}: declared_dependencies is set without manifest_hash; \
+                 the lock is internally inconsistent (stripping `manifest_hash` would \
+                 silently bypass drift detection)"
+            ));
+        }
+
+        if let Some(declared) = &self.declared_dependencies {
+            for (name, range) in declared {
+                super::registry::validate_worker_name(name).map_err(|e| {
+                    format!("{LOCKFILE_NAME} declared dependency `{name}` is invalid: {e}")
+                })?;
+                let trimmed = range.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "{LOCKFILE_NAME} declared dependency `{name}` has empty range"
+                    ));
+                }
+                semver::VersionReq::parse(trimmed).map_err(|e| {
+                    format!(
+                        "{LOCKFILE_NAME} declared dependency `{name}` has invalid \
+                         semver range `{range}`: {e}"
+                    )
+                })?;
+            }
+
+            // Cross-check: when both fields are present they must be
+            // mutually consistent. Compute the canonical hash from
+            // `declared_dependencies` and reject any mismatch — silent
+            // mismatches let drift detection produce empty,
+            // unactionable error reports.
+            if let Some(stored_hash) = &self.manifest_hash {
+                let computed = super::sync::compute_manifest_hash(declared);
+                if &computed != stored_hash {
+                    return Err(format!(
+                        "{LOCKFILE_NAME}: manifest_hash does not match \
+                         declared_dependencies; the lock is internally inconsistent"
+                    ));
+                }
+            }
         }
 
         for (name, worker) in &self.workers {
@@ -583,6 +733,75 @@ workers:
     }
 
     #[test]
+    fn write_to_does_not_leak_temp_files_on_success() {
+        // Atomicity requires writing through a temp file adjacent to the
+        // destination. That temp file must be cleaned up on success; a stale
+        // `.iii.lock.XXXXX.tmp` accumulating next to the lock every run
+        // would be a resource leak.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iii.lock");
+        let lock = WorkerLockfile::default();
+
+        lock.write_to(&path).unwrap();
+
+        assert!(path.exists());
+        let stragglers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "iii.lock")
+            .collect();
+        assert!(
+            stragglers.is_empty(),
+            "expected only iii.lock after successful write; found stragglers: {stragglers:?}"
+        );
+    }
+
+    #[test]
+    fn write_to_preserves_existing_file_when_serialization_fails() {
+        // If the lock fails validation during to_yaml(), the on-disk file
+        // must not be truncated. This is the atomic-rename contract: we
+        // only touch the destination after the new content is fully ready.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iii.lock");
+
+        // Seed a valid lockfile.
+        let mut good = WorkerLockfile::default();
+        good.workers.insert(
+            "first".to_string(),
+            LockedWorker {
+                version: "1.0.0".to_string(),
+                worker_type: LockedWorkerType::Image,
+                dependencies: BTreeMap::new(),
+                source: Some(LockedSource::Image {
+                    image: "ghcr.io/iii-hq/first@sha256:abc".to_string(),
+                }),
+            },
+        );
+        good.write_to(&path).unwrap();
+        let seeded = std::fs::read_to_string(&path).unwrap();
+
+        // Craft a broken lockfile (unpinned image fails validate()).
+        let mut bad = WorkerLockfile::default();
+        bad.workers.insert(
+            "broken".to_string(),
+            LockedWorker {
+                version: "1.0.0".to_string(),
+                worker_type: LockedWorkerType::Image,
+                dependencies: BTreeMap::new(),
+                source: Some(LockedSource::Image {
+                    image: "ghcr.io/iii-hq/broken:latest".to_string(),
+                }),
+            },
+        );
+        let _ = bad.write_to(&path).unwrap_err();
+
+        // Failed write leaves seeded content intact.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, seeded);
+    }
+
+    #[test]
     fn read_from_roundtrips_via_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("iii.lock");
@@ -674,6 +893,164 @@ workers:
         assert!(err.contains("iii-http"));
         assert!(err.contains("engine"));
         assert!(err.contains("source"));
+    }
+
+    #[test]
+    fn manifest_hash_absent_roundtrips() {
+        // Legacy locks written before Lane A don't carry the header.
+        // Reading and writing one must leave it absent, not materialize
+        // an empty string.
+        let yaml = r#"version: 1
+workers:
+  hello:
+    version: 1.0.0
+    type: image
+    dependencies: {}
+    source:
+      kind: image
+      image: ghcr.io/iii-hq/hello@sha256:abc
+"#;
+        let parsed = WorkerLockfile::from_yaml(yaml).unwrap();
+        assert_eq!(parsed.manifest_hash, None);
+
+        let serialized = parsed.to_yaml().unwrap();
+        assert!(
+            !serialized.contains("manifest_hash"),
+            "absent hash must stay absent in output; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn manifest_hash_present_roundtrips() {
+        let hash = format!("{MANIFEST_HASH_PREFIX}{}", "a".repeat(64));
+        let mut lock = WorkerLockfile {
+            manifest_hash: Some(hash.clone()),
+            ..Default::default()
+        };
+        lock.workers.insert(
+            "hello".to_string(),
+            LockedWorker {
+                version: "1.0.0".to_string(),
+                worker_type: LockedWorkerType::Image,
+                dependencies: BTreeMap::new(),
+                source: Some(LockedSource::Image {
+                    image: "ghcr.io/iii-hq/hello@sha256:abc".to_string(),
+                }),
+            },
+        );
+        let serialized = lock.to_yaml().unwrap();
+        assert!(serialized.contains(&hash));
+        let parsed = WorkerLockfile::from_yaml(&serialized).unwrap();
+        assert_eq!(parsed.manifest_hash, Some(hash));
+    }
+
+    #[test]
+    fn declared_dependencies_absent_roundtrips() {
+        let yaml = r#"version: 1
+workers:
+  hello:
+    version: 1.0.0
+    type: image
+    dependencies: {}
+    source:
+      kind: image
+      image: ghcr.io/iii-hq/hello@sha256:abc
+"#;
+        let parsed = WorkerLockfile::from_yaml(yaml).unwrap();
+        assert_eq!(parsed.declared_dependencies, None);
+        let serialized = parsed.to_yaml().unwrap();
+        assert!(
+            !serialized.contains("declared_dependencies"),
+            "absent declared_dependencies must stay absent; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn declared_dependencies_roundtrip_with_entries() {
+        let declared = BTreeMap::from([
+            ("alpha".to_string(), "^1.0".to_string()),
+            ("beta".to_string(), "~2.0".to_string()),
+        ]);
+        // Validation requires manifest_hash and declared_dependencies
+        // to be paired and consistent. Compute the hash from the
+        // declared deps so the roundtrip stays valid.
+        let manifest_hash = Some(super::super::sync::compute_manifest_hash(&declared));
+        let lock = WorkerLockfile {
+            manifest_hash,
+            declared_dependencies: Some(declared.clone()),
+            ..Default::default()
+        };
+        let serialized = lock.to_yaml().unwrap();
+        let parsed = WorkerLockfile::from_yaml(&serialized).unwrap();
+        assert_eq!(parsed.declared_dependencies, Some(declared));
+    }
+
+    #[test]
+    fn declared_dependencies_rejects_empty_range() {
+        // Pair the empty range with a manifest_hash so the (None,Some)
+        // pairing check doesn't fire first — we want to assert the
+        // empty-range check specifically.
+        let yaml = format!(
+            "version: 1\nmanifest_hash: \"{prefix}{hex}\"\ndeclared_dependencies:\n  alpha: \"\"\nworkers: {{}}\n",
+            prefix = MANIFEST_HASH_PREFIX,
+            hex = "0".repeat(64),
+        );
+        let err = WorkerLockfile::from_yaml(&yaml).unwrap_err();
+        assert!(err.contains("alpha"), "got: {err}");
+        assert!(err.contains("empty range"), "got: {err}");
+    }
+
+    #[test]
+    fn from_yaml_rejects_malformed_manifest_hash() {
+        let yaml = r#"version: 1
+manifest_hash: "not-even-close"
+workers: {}
+"#;
+        let err = WorkerLockfile::from_yaml(yaml).unwrap_err();
+        assert!(err.contains("manifest_hash"), "got: {err}");
+        assert!(err.contains(MANIFEST_HASH_PREFIX), "got: {err}");
+    }
+
+    #[test]
+    fn from_yaml_rejects_manifest_hash_with_wrong_algo_prefix() {
+        // Algorithm version bump guard: a lock written by future iii with a
+        // different hash algorithm must not be silently accepted by current
+        // iii. The prefix is the whole point of this check.
+        let yaml = format!(
+            "version: 1\nmanifest_hash: \"sha256:v2:{}\"\nworkers: {{}}\n",
+            "a".repeat(64)
+        );
+        let err = WorkerLockfile::from_yaml(&yaml).unwrap_err();
+        assert!(err.contains("manifest_hash"), "got: {err}");
+    }
+
+    #[test]
+    fn is_valid_manifest_hash_checks_prefix_and_hex_length() {
+        assert!(is_valid_manifest_hash(&format!(
+            "{MANIFEST_HASH_PREFIX}{}",
+            "0".repeat(64)
+        )));
+        assert!(is_valid_manifest_hash(&format!(
+            "{MANIFEST_HASH_PREFIX}{}",
+            "abcdef0123456789".repeat(4)
+        )));
+        // Missing prefix.
+        assert!(!is_valid_manifest_hash(&"0".repeat(64)));
+        // Wrong prefix.
+        assert!(!is_valid_manifest_hash(&format!(
+            "sha512:v1:{}",
+            "0".repeat(64)
+        )));
+        // Short hex.
+        assert!(!is_valid_manifest_hash(&format!(
+            "{MANIFEST_HASH_PREFIX}{}",
+            "0".repeat(63)
+        )));
+        // Non-hex.
+        assert!(!is_valid_manifest_hash(&format!(
+            "{MANIFEST_HASH_PREFIX}{}",
+            "z".repeat(64)
+        )));
     }
 
     #[test]
